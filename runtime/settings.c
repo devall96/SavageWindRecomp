@@ -23,6 +23,7 @@ const char *settings_file(void) {
 
 Settings g_settings = {
     .fullscreen = false,
+    .update_check = true,  // (Prelaunch > Updates: GitHub's release list, at the title menu and the configuration screen)
     .volume = 1.0f,
     .reverb = true,
     .movie_audio = true,
@@ -369,6 +370,8 @@ void settings_load(void) {
                 if (!strcmp(val, g_voice_languages[i].folder)) g_settings.voice_language = i;
         }
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
+        else if (!strcmp(key, "update_check")) g_settings.update_check = atoi(val) != 0;
+        else if (!strcmp(key, "update_skip")) snprintf(g_settings.update_skip, sizeof g_settings.update_skip, "%s", val);
         else bind_settings_load(key, val);  // bind_pad_* / bind_key_*: runtime/hle/bindings.c
     }
     fclose(f);
@@ -568,6 +571,8 @@ void settings_save(void) {
     fprintf(f, "stick_camera_y = %d\n", g_settings.stick_cam_y);
     fprintf(f, "start_at_continue = %d\n", g_settings.auto_continue);
     fprintf(f, "menu_tip_seen = %d\n", g_settings.menu_tip_seen);
+    fprintf(f, "update_check = %d\n", g_settings.update_check);
+    if (g_settings.update_skip[0]) fprintf(f, "update_skip = %s\n", g_settings.update_skip);
     bind_settings_save(f);
     fclose(f);
 }

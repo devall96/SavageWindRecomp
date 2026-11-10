@@ -50,6 +50,7 @@ void controls_bindings_draw(float scale);  // controls_ui.mm
 #include "../input_bind.h"
 #include "../perfmon.h"
 #include "../paths.h"
+#include "../updater.h"
 #include "../pc_cursor.h"
 #include "../imageload.h"
 #ifndef __APPLE__
@@ -179,7 +180,11 @@ extern "C" void menu_size_list_open(void) {
     input_reset();
     g_sizes = true;
 }
-static bool capturing() { return g_open.load() || g_kbd.load() == 1 || g_sizes.load() || console_is_open(); }
+// The title menu's update offer (update_offer_draw): 0 none, 1 the offer, 2 "close the game and update?", 3 closing
+static std::atomic<int> g_upd{0};
+static bool capturing() {
+    return g_open.load() || g_kbd.load() == 1 || g_sizes.load() || g_upd.load() || console_is_open();
+}
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up, or a binding capture begun
 // from the game's Options screen.
 extern "C" bool menu_input_captured(void) {
@@ -279,7 +284,7 @@ bool menu_handle_event(const SDL_Event *e) {
             g_cursor_free = !g_cursor_free.load();
             return true;
         }
-        if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F1 ||
+        if (!e->key.repeat && !g_upd.load() && (e->key.scancode == SDL_SCANCODE_F1 ||  // (the update offer: Esc is its back)
                                (!pc_cursor_enabled() && e->key.scancode == SDL_SCANCODE_ESCAPE && !g_open.load()))) {
             if (!overlay_enabled() || e->key.scancode == SDL_SCANCODE_ESCAPE) {  // (Esc keeps freeing the cursor)
                 if (e->key.scancode == (pc_cursor_enabled() ? SDL_SCANCODE_F2 : SDL_SCANCODE_ESCAPE) && !typing) g_cursor_free = !g_cursor_free.load();
@@ -312,12 +317,14 @@ bool menu_handle_event(const SDL_Event *e) {
             return true;
         }
         ImGuiKey k = key_from_scancode(e->key.scancode);
-        if (g_sizes.load()) {  // Window size's list (in game): the keys bound to A, B and up / down work it too
-            int sc = e->key.scancode;
+        if (g_sizes.load() || g_upd.load()) {  // Window size's list, the update offer (in game): the keys bound to A, B
+            int sc = e->key.scancode;                // and the directions work them too
             if (sc == g_bind_key[BIND_A]) k = ImGuiKey_Enter;
             else if (sc == g_bind_key[BIND_B]) k = ImGuiKey_Escape;
             else if (sc == g_bind_key[BIND_LS_UP] || sc == g_bind_key[BIND_UP]) k = ImGuiKey_UpArrow;
             else if (sc == g_bind_key[BIND_LS_DOWN] || sc == g_bind_key[BIND_DOWN]) k = ImGuiKey_DownArrow;
+            else if (sc == g_bind_key[BIND_LS_LEFT] || sc == g_bind_key[BIND_LEFT]) k = ImGuiKey_LeftArrow;
+            else if (sc == g_bind_key[BIND_LS_RIGHT] || sc == g_bind_key[BIND_RIGHT]) k = ImGuiKey_RightArrow;
         }
         if (k != ImGuiKey_None) { QEvent q = {}; q.kind = QEvent::KEY; q.key = k; q.down = down; push(q); }
         return true;
@@ -333,14 +340,14 @@ bool menu_handle_event(const SDL_Event *e) {
         bool down = e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
         if (e->gbutton.button == SDL_GAMEPAD_BUTTON_BACK) back_down = down;
         if (e->gbutton.button == SDL_GAMEPAD_BUTTON_START) start_down = down;
-        if (down && !typing && overlay_enabled() &&
+        if (down && !typing && overlay_enabled() && !g_upd.load() &&
             ((back_down && start_down) || e->gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE)) {
             set_open(!g_open.load());
             return true;
         }
         if (!capturing()) return false;
         ImGuiKey k = key_from_pad(e->gbutton.button);
-        if (g_sizes.load()) {  // Window size's list (in game): the buttons bound to A and B, wherever they are
+        if (g_sizes.load() || g_upd.load()) {  // Window size's list, the update offer: the buttons bound to A and B
             int b = e->gbutton.button;
             if (b == g_bind_pad[BIND_A]) k = ImGuiKey_GamepadFaceDown;
             else if (b == g_bind_pad[BIND_B]) k = ImGuiKey_GamepadFaceRight;
@@ -1971,6 +1978,128 @@ static void quick_inventory_hint_draw(const ImGuiIO &io) {
     }
 }
 
+// ---- the title menu's update offer (runtime/updater.h) --------------------------------------------------------
+// The game checks GitHub's release list as it starts (runtime/main.c, Check for updates on); a newer release is offered
+// once the title menu is up, once per start, unless Skip this version was chosen for it. Update now asks first, then
+// starts Savage Wind Configuration on its update page (download, install, the game code, the game again) and closes
+// the game. Drawn as the menu is, over the dimmed game; the game gets no input meanwhile (capturing).
+extern "C" bool framepace_title_ui(void);  // (runtime/framepace.h)
+static std::atomic<bool> g_upd_offered{false};  // (menu_draws runs on the game's thread and the render thread)
+static char g_upd_msg[200];
+
+static bool update_offer_due(void) {
+    if (g_upd.load()) return true;
+    if (g_upd_offered.load() || g_open.load() || g_sizes.load() || console_is_open() || !g_settings.update_check ||
+        !framepace_title_ui())
+        return false;
+    UpdStatus u;
+    updater_status(&u);
+    if (u.state != UPD_AVAILABLE || !strcmp(u.latest, g_settings.update_skip)) return false;
+    if (g_upd_offered.exchange(true)) return g_upd.load() != 0;  // (the other thread got there first)
+    g_upd_msg[0] = 0;
+    g_upd = 1;
+    fprintf(stderr, "[update] title menu: version %s offered\n", u.latest);
+    return true;
+}
+
+static void update_offer_draw(ImGuiIO &io, float scale) {
+    static int shown;
+    int st = g_upd.load();
+    bool appearing = st != shown;
+    shown = st;
+    static int frames;
+    frames = appearing ? 0 : frames + 1;
+    // (test) SAVAGEWIND_UPDATE_PICK=<button>[,<button>]: presses the offer's button, then the question's, two seconds
+    // after each is up (as SAVAGEWIND_SIZE_PICK for the size list)
+    int test_pick = -1;
+    if (const char *t = getenv("SAVAGEWIND_UPDATE_PICK"); t && frames == 120 && st <= 2)
+        test_pick = st == 1 ? atoi(t) : strchr(t, ',') ? atoi(strchr(t, ',') + 1) : -1;
+    UpdStatus u;
+    updater_status(&u);
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 140));
+    float w = fminf(io.DisplaySize.x * 0.9f, 1000 * scale);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
+    if (appearing) ImGui::SetNextWindowFocus();
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.93f, 0.76f, 0.33f, 0.55f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f * scale);
+    ImGui::Begin("##update_offer", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::PushFont(g_menu_font);
+    ImGui::PushFont(g_menu_font_big);
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s",
+                       tr(st == 1 ? "Update available" : st == 2 ? "Close the game and update?" : "Closing the game..."));
+    ImGui::PopFont();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::PushTextWrapPos(0);
+    char line[400];
+    bool back = !appearing && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false));
+    auto buttons = [&](const char *const *labels, int n) {
+        int pressed = -1;
+        ImGui::Dummy(ImVec2(0, 6 * scale));
+        for (int i = 0; i < n; i++) {
+            if (i) ImGui::SameLine();
+            const char *l = tr(labels[i]);
+            if (ImGui::Button(l, ImVec2(fmaxf(200 * scale, ImGui::CalcTextSize(l).x + 40 * scale), 0))) pressed = i;
+            if (i == 0 && appearing) {
+                ImGui::SetKeyboardFocusHere(-1);
+                ImGui::SetNavCursorVisible(g_last_pad.load());
+            }
+        }
+        return pressed;
+    };
+    auto close = [&] {
+        g_upd = 0;
+        g_sizes_hold = SDL_GetTicks() + 300;  // (the A / B that closed it, still down, stays out of the game)
+        if (ImGui::IsMouseDown(0)) g_sizes_eat_up = true;
+    };
+    if (st == 1) {
+        snprintf(line, sizeof line, tr("Savage Wind %s is available. You have version %s."), u.latest, u.current);
+        ImGui::TextUnformatted(line);
+        ImGui::TextDisabled("%s", tr("Updating closes the game, downloads and installs the update, builds the game code "
+                                     "again from your game files (a few minutes) and starts the game again. Your saves "
+                                     "and settings are kept."));
+        static const char *const b[] = {"Update now", "What's new", "Later", "Skip this version"};
+        int p = buttons(b, u.notes_url[0] ? 4 : 3);
+        if (test_pick >= 0) p = test_pick;
+        if (!u.notes_url[0] && p >= 1) p++;  // (no release page: the buttons after it move up)
+        if (p == 0) g_upd = 2;
+        else if (p == 1) SDL_OpenURL(u.notes_url);
+        else if (p == 2 || back) close();
+        else if (p == 3) {
+            snprintf(g_settings.update_skip, sizeof g_settings.update_skip, "%s", u.latest);
+            settings_save();
+            close();
+        }
+    } else if (st == 2) {
+        snprintf(line, sizeof line, tr("The game closes now, and Savage Wind updates to version %s (%.0f MB to download)."),
+                 u.latest, u.total / 1e6);
+        ImGui::TextUnformatted(line);  // (offered on the title menu only: there is no progress to lose)
+        if (g_upd_msg[0]) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", g_upd_msg);
+        static const char *const b[] = {"Yes, update now", "Cancel"};
+        int p = buttons(b, 2);
+        if (test_pick >= 0) p = test_pick;
+        if (p == 0) {
+            settings_save();
+            if (updater_start_update()) {
+                g_upd = 3;
+                SDL_Event q = {};  // (as Quit to Desktop: the game ends the usual way)
+                q.type = SDL_EVENT_QUIT;
+                SDL_PushEvent(&q);
+            } else
+                snprintf(g_upd_msg, sizeof g_upd_msg, "%s", tr("Savage Wind Configuration didn't start. Update from it yourself: "
+                                                               "Settings > Prelaunch > Updates."));
+        } else if (p == 1 || back) g_upd = 1;
+    } else
+        ImGui::TextUnformatted(tr("Savage Wind Configuration takes over the update."));
+    ImGui::PopTextWrapPos();
+    ImGui::PopFont();
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
+
 // Everything menu_render draws, in one place: menu_render_needed (the caller's cue to drain the recorder first) and
 // menu_render (which decides again, and drains itself) must agree on it. The pointer's hover box, the console and the
 // gyro drag were missing here: their frames went to the command buffer while the recorder thread was still filling it.
@@ -1981,7 +2110,7 @@ static bool menu_draws(bool *pointer_hover = NULL, float *pointer_box = NULL, bo
     bool gyro_on = pc_gyro_scene_view(gyro ? gyro : &gs);
     if (pointer_hover) *pointer_hover = hover;
     if (gyro_show) *gyro_show = gyro_on;
-    return g_open.load() || g_kbd.load() == 1 || g_sizes.load() || console_is_open() || gyro_on || hover ||
+    return g_open.load() || g_kbd.load() == 1 || g_sizes.load() || console_is_open() || gyro_on || hover || update_offer_due() ||
            g_settings.perf_overlay != PERF_OFF || act_log_enabled() || quick_inventory_sort_hint() || quick_drop_hint_state();
 }
 
@@ -1998,6 +2127,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     bool kbd = g_kbd.load() == 1;
     bool sizes = g_sizes.load();
     bool con = console_is_open();
+    bool upd = g_upd.load() != 0;
     console_collect();
     GyroScene gyro_scene;
     bool gyro_scene_show;
@@ -2117,6 +2247,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 
     if (kbd) keyboard_draw(io, scale);
     if (sizes) size_list_draw(io, scale);
+    if (upd && !open) update_offer_draw(io, scale);
     if (con) console_draw(io, scale, g_font_mono ? g_font_mono : g_font);
     ImGui::Render();
     g_text_busy = open && ui_text_busy();

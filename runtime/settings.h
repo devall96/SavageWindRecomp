@@ -168,6 +168,9 @@ typedef struct {
     bool save_backups;   // Saves > Back up at each start: a copy of the save folder as the game starts (runtime/save_backup.c)
     bool auto_continue;  // Gameplay > Start at Continue: past the start screen into the latest save (hle/input.c)
     bool menu_tip_seen;  // the start screen's one-time "how to open the menu" note was shown (first PLAY ever)
+    bool update_check;   // Prelaunch > Updates: look for a new release at the title menu and when the configuration screen
+                         // opens (runtime/updater.h)
+    char update_skip[32];  // the release the title menu's Skip this version was chosen for: not offered there again
 } Settings;
 
 #define RUMBLE_STRENGTH_MIN 10

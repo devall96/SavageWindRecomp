@@ -16,6 +16,7 @@
 #include "romfs_image.h"
 #include "services/save_convert.h"
 #include "services/save_profiles.h"
+#include "updater.h"
 #include "settings.h"
 #include "hle.h"
 #include "kernel.h"
@@ -333,6 +334,7 @@ static int dump_romfs(const char *root, const char *out_path) {
 // Settings, the game files, Quit ("Savage Wind Configuration", --config; Quit to Start Screen comes back to it).
 enum { LAUNCHER_SETUP, LAUNCHER_CONFIG, LAUNCHER_NONE };
 void launcher_run(const char *root, int mode);
+void launcher_update_flow(int flow, bool then_play, unsigned long wait_pid);  // (--update / --updated: its update page)
 bool launcher_game_ready(const char *root);
 bool launcher_config_key_held(void);  // (macOS: Option held while the app opens)
 
@@ -354,9 +356,16 @@ int main(int argc, char **argv) {
     static char arg_root[1024];
     const char *dump = NULL, *seed_out = NULL;
     bool scan = false, precompile = false;
+    int update_flow = 0;  // the configuration screen's update (runtime/updater.h): 1 download and install, 2 installed
+    bool then_play = false;
+    unsigned long wait_pid = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
         else if (!strcmp(argv[i], "--config")) config = true;
+        else if (!strcmp(argv[i], "--update")) update_flow = 1, config = true;  // (the title menu's Update now)
+        else if (!strcmp(argv[i], "--updated")) update_flow = 2, config = true;  // (the new version, just installed)
+        else if (!strcmp(argv[i], "--then-play")) then_play = true;             // (and the game afterwards)
+        else if (!strcmp(argv[i], "--wait-pid") && i + 1 < argc) wait_pid = strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--dump-romfs") && i + 1 < argc) dump = argv[++i];
         else if (!strcmp(argv[i], "--scan-shaders")) scan = true;
         else if (!strcmp(argv[i], "--precompile-shaders")) precompile = true;
@@ -368,6 +377,8 @@ int main(int argc, char **argv) {
     if (launcher_config_key_held()) config = true;  // (the Mac's "Savage Wind Configuration": Option held)
 #endif
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+    updater_cleanup();  // (runtime/updater.h: the previous version's files, after an update installed from the start screen)
+    if (getenv("SAVAGEWIND_UPDATE_TEST")) return updater_test(getenv("SAVAGEWIND_UPDATE_TEST"));
     // (after it: savagewind.ini is in the data root; before it the file wasn't found where that isn't where we started)
     settings_load();
     static const char *const sparse_heap_modes[SPARSE_HEAP_COUNT] = {"auto", "on", "off"};
@@ -400,10 +411,19 @@ int main(int argc, char **argv) {
         ui_window_init_hidden();
     }
 #endif
+    if (update_flow) launcher_update_flow(update_flow, then_play, wait_pid);
     for (;;) {
         if (mode != LAUNCHER_NONE) {
             launcher_run(root, mode);
             launch_flags_play(root);  // changed launch options: restart straight into the game with them
+        }
+        // a new release, for the title menu to offer (runtime/ui/menu.mm; not in test runs, which press their own way
+        // through the title menu)
+        if (g_settings.update_check && !getenv("SAVAGEWIND_NO_LAUNCHER") && !getenv("SAVAGEWIND_INPUT") &&
+            !getenv("SAVAGEWIND_HIDDEN") && updater_available()) {
+            UpdStatus u;
+            updater_status(&u);
+            if (u.state == UPD_IDLE) updater_check();
         }
         // The game holds the lock on its save folder while it runs, so the Saves tab of another Savage Wind refuses to
         // swap or copy saves under it. Not getting it (somebody else has it, or no lock file can be made) never stops

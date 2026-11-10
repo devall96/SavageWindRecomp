@@ -53,6 +53,7 @@ extern "C" {
 #include "dlc_check.h"
 #include "romfs_build.h"
 #include "problem_report.h"
+#include "updater.h"
 #include "settings.h"
 #include "color_grade.h"
 #include "pc_cursor.h"
@@ -876,7 +877,7 @@ static void remove_fonts() {
 
 // ------------------------------------------------------------------ screen
 static ImFont *g_font_title, *g_font_menu, *g_font_small;
-enum Page { MAIN, SETTINGS, SETUP };  // SETTINGS: the in-game menu's tabs (runtime/ui/menu.mm)
+enum Page { MAIN, SETTINGS, SETUP, UPDATE };  // SETTINGS: the in-game menu's tabs (runtime/ui/menu.mm); UPDATE: update_page
 static int g_refocus = MAIN;  // back on the main page: select the item of the page we came from (controllers)
 
 // A big menu line: gold + a marker when focused / hovered (keyboard, gamepad or mouse), grey when disabled
@@ -1099,6 +1100,371 @@ void reveal_folder(const std::string &dir) {
 
 static SDL_Window *g_launcher_win;
 static bool g_files_deleted;  // set here: the start screen goes back to setting the game files up
+
+// Prelaunch > Updates (runtime/updater.h): look for a new release, download it, install it and start again. Nothing
+// happens unless asked (or Check for updates automatically is on).
+static void updates_section(float sc) {
+    static std::string apply_msg;
+    UpdStatus u;
+    updater_status(&u);
+    pthread_mutex_lock(&g_lock);
+    bool setup_busy = g_busy;  // (the game code being built: its compiler is one of the files an update replaces)
+    pthread_mutex_unlock(&g_lock);
+    const ImVec4 green(0.47f, 0.86f, 0.47f, 1), orange(1, 0.72f, 0.4f, 1);
+    ImGui::Text(tr("Installed: version %s"), u.current);
+    ImGui::PushTextWrapPos(0);
+    switch (u.state) {
+    case UPD_CHECKING:
+        ImGui::TextDisabled("%s", tr("Checking for updates..."));
+        break;
+    case UPD_AVAILABLE:
+        ImGui::TextColored(green, tr("Version %s is available (%.0f MB)."), u.latest, u.total / 1e6);
+        if (ImGui::Button(tr("Download"))) updater_download();
+        if (u.notes_url[0]) {
+            ImGui::SameLine();
+            if (ImGui::Button(tr("What's new"))) SDL_OpenURL(u.notes_url);
+        }
+        break;
+    case UPD_DOWNLOADING:
+        ImGui::Text(tr("Downloading version %s..."), u.latest);
+        ImGui::ProgressBar(u.total ? (float)((double)u.done / (double)u.total) : 0.0f, ImVec2(420 * sc, 0));
+        if (ImGui::Button(tr("Cancel"))) updater_cancel();
+        break;
+    case UPD_READY:
+        ImGui::TextColored(green, tr("Version %s is downloaded and checked."), u.latest);
+        ImGui::TextUnformatted(tr(u.gamecode == UPD_KEPT ? "The game code stays as it is."
+                                  : u.gamecode == UPD_REDONE ? "Afterwards the game code is built again: Game Files > Set up game files (a few minutes)."
+                                  : "Afterwards the game code may have to be built again: Game Files > Set up game files."));
+        if (u.shaders != UPD_UNKNOWN)
+            ImGui::TextUnformatted(tr(u.shaders == UPD_KEPT ? "Shaders are kept."
+                                      : "Shaders are made again as they are first drawn, or all at once with Precompile shaders."));
+        ImGui::TextDisabled("%s", tr("Game files, saves and settings are kept."));
+        ImGui::BeginDisabled(setup_busy);
+        if (ImGui::Button(tr("Install and restart"))) {
+            settings_save();
+            char why[300] = "";
+            updater_apply(false, why, sizeof why);  // (returns only when Savage Wind didn't start again)
+            apply_msg = why;
+        }
+        ImGui::EndDisabled();
+        break;
+    default:  // not checked yet, up to date, failed
+        if (u.state == UPD_UP_TO_DATE) ImGui::TextColored(green, "%s", tr("Savage Wind is up to date."));
+        if (u.state == UPD_FAILED) ImGui::TextColored(orange, "%s %s", tr("The update didn't work:"), u.error);
+        if (ImGui::Button(tr("Check for updates"))) apply_msg.clear(), updater_check();
+        if (u.state == UPD_FAILED && u.latest[0]) {
+            ImGui::SameLine();
+            if (ImGui::Button(tr("Try again"))) updater_download();
+        }
+    }
+    if (!apply_msg.empty()) ImGui::TextColored(orange, "%s", apply_msg.c_str());
+    if (ImGui::Checkbox(tr("Check for updates automatically"), &g_settings.update_check)) settings_save();
+    ImGui::TextDisabled("%s", tr("Updates come from Savage Wind's releases on GitHub: only GitHub is contacted, and only "
+                                 "for the list of releases and the download."));
+    ImGui::PopTextWrapPos();
+}
+
+// ------------------------------------------------------------------ the update page (runtime/updater.h)
+// --update (the title menu's Update now, runtime/ui/menu.mm): waits for the game to end, then checks, downloads and
+// installs; the new version starts again with --updated (also after Prelaunch > Updates > Install and restart): it
+// builds the game code again from the game files set up before, and with --then-play starts the game. Each step on one
+// card with its progress, as the setup's.
+// 3: no --updated, but the game code found out of date at the start while the game files are there (a version
+// unzipped over this one, an older version's updater, a build stopped halfway): built again by itself as well
+static int g_uflow;  // 0: no update page; 1: download and install; 2: installed, the game code next; 3: see above
+static bool g_uplay;
+static bool g_ufresh;  // (launcher_run: the page starts over - another visit after Quit to Start Screen)
+static bool g_setup_only;  // (launcher_run's mode 0: started as the game, which starts once the game code is ready)
+static unsigned long g_uwait;
+extern "C" void launcher_update_flow(int flow, bool then_play, unsigned long wait_pid) {
+    g_uflow = flow, g_uplay = then_play, g_uwait = wait_pid;
+}
+
+static std::atomic<bool> g_game_ended{false};
+static void *wait_game_thread(void *) {
+    if (!updater_wait_pid(g_uwait, 30000)) fprintf(stderr, "[launcher] update: the game is still running after 30 s\n");
+    g_game_ended = true;
+    return NULL;
+}
+
+enum { U_INIT, U_WAIT_GAME, U_CHECK, U_DOWNLOAD, U_INSTALL, U_REBUILD, U_DONE, U_NOTHING, U_NO_FILES, U_FAILED, U_STOPPED };
+
+// The card's progress bar (as the setup's: gold on a faint track) and the line under it
+static void update_bar(float sc, float f, const char *line) {
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec2 a = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x, h = 24 * sc;
+    dl->AddRectFilled(a, ImVec2(a.x + w, a.y + h), IM_COL32(255, 255, 255, 25), 12 * sc);
+    if (f > 0) dl->AddRectFilled(a, ImVec2(a.x + w * (f > 1 ? 1 : f), a.y + h), IM_COL32(236, 194, 84, 255), 12 * sc);
+    ImGui::Dummy(ImVec2(w, h));
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.86f, 0.85f, 0.80f, 1), "%s", line);
+}
+
+// A row of buttons; returns the one pressed (-1: none). The first is the default (Enter / A) when the row appears.
+static int update_buttons(float sc, const char *const *labels, int n, bool appearing) {
+    int pressed = -1;
+    ImGui::Dummy(ImVec2(0, 10 * sc));
+    for (int i = 0; i < n; i++) {
+        if (i) ImGui::SameLine();
+        if (ImGui::Button(tr(labels[i]), ImVec2(fmaxf(230 * sc, ImGui::CalcTextSize(tr(labels[i])).x + 40 * sc), 0))) pressed = i;
+        if (i == 0 && appearing) ImGui::SetItemDefaultFocus(), ImGui::SetKeyboardFocusHere(-1);
+    }
+    return pressed;
+}
+
+// The update page; play / page / status are launcher_run's
+static void update_page(float sc, ImVec2 ds, bool busy, std::string &status, int &page_out, bool &play) {
+    static int stage = U_INIT, shown = -1, install_frames;
+    static bool asked_check, ask_stop;
+    static std::string err, version;
+    static uint64_t done_at;
+    if (g_ufresh) g_ufresh = false, stage = U_INIT, shown = -1, asked_check = ask_stop = false, err.clear(), version.clear();
+    UpdStatus u;
+    updater_status(&u);
+    if (stage == U_INIT) {
+        if (g_uflow == 1) {
+            stage = g_uwait ? U_WAIT_GAME : U_CHECK;
+            if (g_uwait) { pthread_t t; pthread_create(&t, NULL, wait_game_thread, NULL); pthread_detach(t); }
+        } else if (!check_copied_files(g_root).empty()) stage = U_NO_FILES;  // (no game files from before: set them up)
+        else if (status.empty()) stage = U_DONE;  // (the game code didn't change)
+        else {  // the game files' page's Set up game files with no folder chosen: the game code from Savage Wind's copy
+            pthread_mutex_lock(&g_lock);
+            g_src.clear();
+            g_busy = true;
+            pthread_mutex_unlock(&g_lock);
+            set_job("Building the game code...");
+            pthread_t t;
+            pthread_create(&t, NULL, extract_thread, NULL);
+            pthread_detach(t);
+            stage = U_REBUILD;
+        }
+        fprintf(stderr, "[launcher] update page: flow %d, stage %d%s\n", g_uflow, stage, g_uplay ? ", then the game" : "");
+    }
+    // the state machine
+    switch (stage) {
+    case U_WAIT_GAME:
+        if (g_game_ended) stage = U_CHECK;
+        break;
+    case U_CHECK:
+        if (!asked_check && u.state != UPD_READY) asked_check = true, updater_check();
+        else if (u.state == UPD_AVAILABLE) updater_download(), stage = U_DOWNLOAD;
+        else if (u.state == UPD_READY) stage = U_INSTALL;
+        else if (u.state == UPD_UP_TO_DATE) stage = U_NOTHING;
+        else if (u.state == UPD_FAILED) stage = U_FAILED, err = u.error;
+        break;
+    case U_DOWNLOAD:
+        if (u.state == UPD_READY) stage = U_INSTALL, install_frames = 0;
+        else if (u.state == UPD_FAILED) stage = U_FAILED, err = u.error;
+        else if (u.state == UPD_AVAILABLE) stage = U_STOPPED;  // (stopped)
+        break;
+    case U_INSTALL:
+        if (++install_frames == 3) {  // (the card says Installing first: putting the files in place takes a moment)
+            settings_save();
+            char why[300] = "";
+            updater_apply(g_uplay, why, sizeof why);  // (starts the new version: returns only when that didn't happen)
+            stage = U_FAILED, err = why;
+        }
+        break;
+    case U_REBUILD: {
+        pthread_mutex_lock(&g_lock);  // (now, not the frame's start: the build may have been started this frame)
+        bool running = g_busy;
+        std::string job = g_job, hint = g_job_hint;
+        pthread_mutex_unlock(&g_lock);
+        if (!running) {
+            status = check_game_files(g_root);
+            stage = status.empty() ? U_DONE : U_FAILED;
+            err = tr(job.c_str()) + (hint.empty() ? std::string() : std::string(". ") + tr(hint.c_str()));
+            fprintf(stderr, "[launcher] update: the game code %s\n", status.empty() ? "is ready" : status.c_str());
+        }
+        break;
+    }
+    }
+    bool appearing = stage != shown;
+    if (appearing) {
+        shown = stage, ask_stop = false;
+        if (stage == U_DONE) done_at = SDL_GetTicks();
+    }
+    if (version.empty()) version = g_uflow == 1 ? "" : rt_version();
+    const char *latest = g_uflow == 1 ? u.latest : version.c_str();
+
+    // the card, in the in-game menu's colours (runtime/ui/menu.mm style_init), as high as what it holds
+    static float card_h = 300;  // (last frame's: centred by it)
+    float w = fminf(ds.x - 36 * sc, 1060 * sc);
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImGui::GetWindowDrawList()->AddRectFilled(wp, ImVec2(wp.x + ds.x, wp.y + ds.y), IM_COL32(0, 0, 0, 110));
+    ImGui::SetCursorScreenPos(ImVec2(wp.x + (ds.x - w) * 0.5f, wp.y + fmaxf(18 * sc, (ds.y - card_h) * 0.5f)));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.09f, 0.08f, 0.96f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.93f, 0.76f, 0.33f, 0.55f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.93f, 0.76f, 0.33f, 0.25f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.22f, 0.18f, 1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.36f, 0.25f, 1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.21f, 0.50f, 0.34f, 1));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * sc);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.5f * sc);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(40 * sc, 32 * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(20 * sc, 12 * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8 * sc);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(14 * sc, 12 * sc));
+    ImGui::BeginChild("##update", ImVec2(w, 0), ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_Borders |
+                      ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NavFlattened);
+    ImGui::PushFont(g_font_small);
+    ImGui::PushFont(g_font_menu);
+    const char *title = stage == U_DONE || stage == U_NO_FILES ? "Savage Wind is updated" : stage == U_FAILED ? "The update didn't finish"
+                      : stage == U_NOTHING ? "No update needed" : stage == U_STOPPED ? "Update stopped" : "Updating Savage Wind";
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr(title));
+    ImGui::PopFont();
+    {   // the steps: done ones green, the one running gold, the rest grey
+        static const char *const names[] = {"Download", "Install", "Game code", "Play"};
+        int n = g_uplay ? 4 : 3, first = g_uflow == 3 ? 2 : 0;  // (3: nothing downloaded here, the game code alone)
+        int at = stage <= U_DOWNLOAD ? 0 : stage == U_INSTALL ? 1 : stage == U_REBUILD ? 2 : stage == U_DONE ? 3 : -1;
+        if (g_uflow >= 2 && stage == U_FAILED) at = 2;
+        if (at >= first && n - first > 1) {
+            ImGui::Spacing();
+            for (int i = first; i < n; i++) {
+                if (i > first) { ImGui::SameLine(); ImGui::TextDisabled(">"); ImGui::SameLine(); }
+                ImVec4 c = i < at ? ImVec4(0.47f, 0.86f, 0.47f, 1) : i == at ? ImVec4(0.93f, 0.76f, 0.33f, 1) : ImVec4(0.55f, 0.56f, 0.52f, 1);
+                ImGui::TextColored(c, "%d  %s", i - first + 1, tr(names[i]));
+            }
+        }
+    }
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 8 * sc));
+    ImGui::PushTextWrapPos(0);
+    char line[400];
+    bool back = !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+                (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false));
+    auto close = [&] {  // (started as the game: nothing else to show, so closing the card closes it, as the setup page)
+        if (g_setup_only) settings_save(), exit(0);
+        g_uflow = 0, stage = U_INIT, shown = -1, asked_check = false, page_out = MAIN;
+    };
+    switch (stage) {
+    case U_WAIT_GAME:
+        ImGui::TextUnformatted(tr("Waiting for the game to close..."));
+        update_bar(sc, 0, "");
+        break;
+    case U_CHECK:
+        ImGui::TextUnformatted(tr("Checking for updates..."));
+        update_bar(sc, 0, "");
+        break;
+    case U_DOWNLOAD:
+        snprintf(line, sizeof line, tr("Downloading version %s..."), latest);
+        ImGui::TextUnformatted(line);
+        snprintf(line, sizeof line, tr("%.1f of %.1f MB"), u.done / 1e6, u.total / 1e6);
+        update_bar(sc, u.total ? (float)((double)u.done / (double)u.total) : 0, line);
+        ImGui::TextDisabled("%s", tr("Then Savage Wind installs it and starts again by itself."));
+        {
+            static bool asked_shown;  // (the question's first frame: its first button takes the focus)
+            bool ask_appearing = ask_stop != asked_shown;
+            asked_shown = ask_stop;
+            if (!ask_stop) {
+                static const char *const b[] = {"Cancel"};
+                if (update_buttons(sc, b, 1, appearing || ask_appearing) == 0 || back) ask_stop = true;
+            } else {
+                ImGui::Dummy(ImVec2(0, 6 * sc));
+                ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "%s", tr("Stop the update? Nothing is changed."));
+                static const char *const b[] = {"Keep downloading", "Yes, stop"};
+                int p = update_buttons(sc, b, 2, ask_appearing);
+                if (p == 0 || back) ask_stop = false;
+                if (p == 1) updater_cancel();
+            }
+        }
+        break;
+    case U_INSTALL:
+        snprintf(line, sizeof line, tr("Installing version %s..."), latest);
+        ImGui::TextUnformatted(line);
+        update_bar(sc, 1, tr("Savage Wind starts again in a moment."));
+        break;
+    case U_REBUILD: {
+        pthread_mutex_lock(&g_lock);
+        std::string job = g_job;
+        pthread_mutex_unlock(&g_lock);
+        float f = extract_progress();
+        std::string step = tr(job.c_str());
+#ifndef __APPLE__
+        if (g_precompiling) f = shader_precompile_progress(&g_pc), step = precompile_line();
+#endif
+        snprintf(line, sizeof line, tr("Building the game code for version %s from your game files..."), latest);
+        ImGui::TextUnformatted(line);
+        snprintf(line, sizeof line, "%s   %d%%", step.c_str(), (int)(f * 100));
+        update_bar(sc, f, line);
+        ImGui::TextDisabled("%s", tr("This takes a few minutes. Your saves and settings are kept."));
+        break;
+    }
+    case U_DONE: {
+        snprintf(line, sizeof line, tr("Version %s is installed and the game code is ready."), latest);
+        ImGui::TextColored(ImVec4(0.47f, 0.86f, 0.47f, 1), "%s", line);
+        update_bar(sc, 1, "");
+        if (g_uplay) {
+            int left = 5 - (int)((SDL_GetTicks() - done_at) / 1000);
+            snprintf(line, sizeof line, tr("The game starts in %d s."), left > 0 ? left : 0);
+            ImGui::TextUnformatted(line);
+            static const char *const b0[] = {"Play now", "Stay here"}, *const b1[] = {"Play now", "Close"};
+            const char *const *b = g_setup_only ? b1 : b0;
+            int p = update_buttons(sc, b, 2, appearing);
+            if (p == 0 || left <= 0) play = true;
+            if (p == 1 || back) close();
+        } else {
+            static const char *const b[] = {"Play", "Close"};
+            int p = update_buttons(sc, b, 2, appearing);
+            if (p == 0) play = true;
+            if (p == 1 || back) close();
+        }
+        break;
+    }
+    case U_NOTHING: {
+        snprintf(line, sizeof line, tr("Savage Wind is up to date (version %s)."), u.current);
+        ImGui::TextUnformatted(line);
+        static const char *const b[] = {"Play", "Close"};
+        int p = update_buttons(sc, b, status.empty() ? 2 : 1, appearing);
+        if (p == 0 && status.empty()) play = true;
+        else if (p >= 0 || back) close();
+        break;
+    }
+    case U_NO_FILES: {
+        snprintf(line, sizeof line, tr("Savage Wind %s is installed. There are no game files set up yet: set them up to play."),
+                 latest);
+        ImGui::TextUnformatted(line);
+        static const char *const b[] = {"Set up game files", "Close"};
+        int p = update_buttons(sc, b, 2, appearing);
+        if (p == 0) close(), page_out = SETUP;
+        else if (p == 1 || back) close();
+        break;
+    }
+    case U_STOPPED: {
+        ImGui::TextUnformatted(tr("The download was stopped. Nothing was changed."));
+        static const char *const b[] = {"Download again", "Close"};
+        int p = update_buttons(sc, b, 2, appearing);
+        if (p == 0) updater_download(), stage = U_DOWNLOAD;
+        else if (p == 1 || back) close();
+        break;
+    }
+    case U_FAILED: {
+        ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "%s", err.c_str());
+        bool rebuild = g_uflow >= 2;
+        if (rebuild)
+            ImGui::TextUnformatted(tr("The update is installed, but the game code still has to be built: the Game Files page "
+                                      "can do it again."));
+        else {
+            snprintf(line, sizeof line, tr("Nothing was changed: version %s is still installed."), u.current);
+            ImGui::TextUnformatted(line);
+        }
+        static const char *const b1[] = {"Try again", "Close"}, *const b2[] = {"Open Game Files", "Close"};
+        int p = update_buttons(sc, rebuild ? b2 : b1, 2, appearing);
+        if (p == 0 && rebuild) close(), page_out = SETUP;
+        else if (p == 0) asked_check = false, stage = U_CHECK;
+        else if (p == 1 || back) close();
+        break;
+    }
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::PopFont();
+    card_h = ImGui::GetWindowHeight();
+    ImGui::EndChild();
+    ImGui::PopStyleVar(6);
+    ImGui::PopStyleColor(6);
+}
+
 static void prelaunch_tab(float sc) {
     const ImVec4 gold(0.93f, 0.76f, 0.33f, 1);
     auto heading = [&](const char *t) {
@@ -1154,6 +1520,20 @@ static void prelaunch_tab(float sc) {
     if (gamelib_compat()) {  // (runtime/gamelib.h: built for CPUs without AVX2 / FMA)
         ImGui::Spacing();
         ImGui::TextDisabled("%s", tr("Game code: compatible mode (this CPU has no AVX2 / FMA), slower"));
+    }
+    if (updater_available()) {  // (a Windows release folder)
+        ImGui::Spacing();
+        ImGui::Spacing();
+        heading("Updates");
+        updates_section(sc);
+    } else if (const char *by = updater_managed_by()) {  // (installed by a launcher: its updates)
+        ImGui::Spacing();
+        ImGui::Spacing();
+        heading("Updates");
+        ImGui::PushTextWrapPos(0);
+        ImGui::Text(tr("Savage Wind's updates come from %s, which installed it. After an update, the next start builds "
+                       "the game code again by itself."), by);
+        ImGui::PopTextWrapPos();
     }
     ImGui::Spacing();
     ImGui::Spacing();
@@ -1340,7 +1720,6 @@ extern "C" void boot_splash_close(void) {
 
 // mode (runtime/main.c): 0 setup - the game files page alone, the game starts once they're ready; 1 configuration.
 // Returns when the game is to start; QUIT (and closing the setup page) exits.
-static bool g_setup_only;
 extern "C" void launcher_run(const char *root, int mode) {
     g_root = root;
     saves_tab_set_game_files(root);
@@ -1387,9 +1766,23 @@ extern "C" void launcher_run(const char *root, int mode) {
     remove_old_image(g_root);
     std::string status = check_game_files(g_root);
     refresh_dlc();
-    Page page = status.empty() && !g_setup_only ? MAIN : SETUP;
+    // the game code out of date while the game files are there (no --updated): built again by itself, as after an
+    // update (not for the tests that set the game files up themselves or take screenshots of the pages)
+    if (!g_uflow && !status.empty() && check_copied_files(g_root).empty() && !getenv("SAVAGEWIND_LAUNCHER_SHOT") &&
+        !getenv("SAVAGEWIND_SETUP_FROM") && !getenv("SAVAGEWIND_LAUNCHER_EXTRACT") && !getenv("SAVAGEWIND_LAUNCHER_SETUP")) {
+        g_uflow = 3, g_uplay = g_setup_only;  // (started as the game: on into it after)
+        fprintf(stderr, "[launcher] %s, the game files are there: building the game code again by itself\n", status.c_str());
+    }
+    if (g_setup_only && g_uflow != 3) g_uflow = 0;  // (the setup-only start has no other update page)
+    Page page = g_uflow ? UPDATE : status.empty() && !g_setup_only ? MAIN : SETUP;
+    g_ufresh = true;
     set_job("");  // (an earlier visit's result)
     explain_status(status);
+    // Prelaunch > Updates: Check for updates automatically (not in the setup-only screen, nor on the
+    // update page, which checks itself; screenshot tests only with SAVAGEWIND_UPDATE_AS, a check from that version)
+    if (!g_setup_only && !g_uflow && g_settings.update_check && updater_available() &&
+        (!getenv("SAVAGEWIND_LAUNCHER_SHOT") || getenv("SAVAGEWIND_UPDATE_AS")))
+        updater_check();
     bool play = false;
     bool tip_then_play = false;  // (setup mode: the game files just got ready; the first-start note, then the game)
     // SAVAGEWIND_LAUNCHER_SHOT=<frame>[:<page>] (test): save build/launcher.png at that frame and exit; page: settings[:<tab>] / askdelete / setup
@@ -1476,10 +1869,11 @@ extern "C" void launcher_run(const char *root, int mode) {
         g_file_size.set_suspended(busy);
         if (was_busy && !busy) {
             status = check_game_files(g_root);
-            if (status.empty() && g_setup_only) {  // set up: on into the game (after the first-start note)
+            if (status.empty() && g_setup_only && page != UPDATE) {  // set up: on into the game (after the first-start note)
                 if (g_settings.menu_tip_seen) play = true;
                 else tip_then_play = true;
-            } else if (status.empty() && !stay_on_setup_finished()) page = MAIN;
+            } else if (status.empty() && page != UPDATE && !stay_on_setup_finished()) page = MAIN;
+            else if (page == UPDATE) stay_on_setup_finished();  // (the update page says how the build went itself)
         }
         was_busy = busy;
 
@@ -1651,6 +2045,13 @@ extern "C" void launcher_run(const char *root, int mode) {
                     bind_capture_cancel();
                     settings_save();
                     page = MAIN, g_refocus = SETTINGS;
+                }
+            } else if (page == UPDATE) {
+                int next = UPDATE;
+                update_page(ds.y / 1080.0f, ds, busy, status, next, play);
+                if (next != UPDATE) {
+                    page = (Page)next;
+                    if (page == SETUP) explain_status(status), refresh_dlc();
                 }
             } else {
                 // SETUP: the game files, in a window like Settings (option rows: runtime/ui/option_rows.h) - choose the
@@ -2054,6 +2455,16 @@ extern "C" void launcher_run(const char *root, int mode) {
                 ImVec2 p(right - vsz.x, y);
                 for (float d : {2.5f, 1.5f, 0.8f}) dl->AddText(font, vs, ImVec2(p.x + d * s, p.y + d * s), IM_COL32(4, 8, 30, 150), ver);
                 dl->AddText(font, vs, p, IM_COL32(255, 255, 255, 255), ver);
+                UpdStatus u;  // under it: a newer release found (Settings > Prelaunch > Updates, which says it itself)
+                updater_status(&u);
+                if (page != SETTINGS && page != UPDATE && (u.state == UPD_AVAILABLE || u.state == UPD_READY)) {
+                    char up[160];
+                    snprintf(up, sizeof up, tr("Update available: version %s (Settings)"), u.latest);
+                    float us = fs * 0.95f;
+                    ImVec2 usz = font->CalcTextSizeA(us, FLT_MAX, 0, up), q(right - usz.x, y + vsz.y + 4 * s);
+                    dl->AddText(font, us, ImVec2(q.x + 1.2f * s, q.y + 1.2f * s), IM_COL32(4, 8, 30, 170), up);
+                    dl->AddText(font, us, q, IM_COL32(255, 214, 64, 255), up);
+                }
             }
             ImGui::PopFont();
             }
@@ -2103,6 +2514,7 @@ extern "C" void launcher_run(const char *root, int mode) {
     }
     // play: cancel the size traversal before handing the window to the game
     g_file_size.stop();
+    g_uflow = 0, g_uplay = false;  // (the update page done with: Quit to Start Screen comes back to the start screen)
     settings_save();
     SDL_SetWindowTitle(win, "Savage Wind");
     splash_unload();

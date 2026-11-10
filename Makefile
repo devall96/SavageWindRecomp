@@ -115,7 +115,7 @@ GENFLAGS += -D_FILE_OFFSET_BITS=64 $(GENARCH)
 # --stack: every thread's default stack, reserved (committed as it grows): 256 MB, the guest threads' recursion runs on
 # it (runtime/kernel.c thread_start)
 LDFLAGS  := -fuse-ld=lld -Wl,--stack,268435456 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
-            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -lpdh -lws2_32 -l:libz.a \
+            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -lpdh -lws2_32 -lwinhttp -lbcrypt -l:libz.a \
             $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)  # release: no console window (log -> savagewind.log)
 # NVIDIA DLSS is an optional external SDK. Keep proprietary files out of this
 # repository; source builds can point at the sibling checkout with DLSS_SDK=../DLSS.
@@ -433,6 +433,11 @@ dist:
 	    xargs -I{} cp -u {} "$(DIST)/"
 	! ls "$(DIST)" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)
 	! ls "$(DIST)" | grep -i splash  # (no start screen picture: the player's own, never shipped)
+	# for the updater (runtime/updater.h): what this release's game code and shaders are made from, so an update can
+	# say whether they will be made again; and the files it ships, so the next update removes the ones it drops
+	printf 'gamelib %s\ngamelib_compat %s\ntranslator %s\nspirv %s\n' '$(GAMELIB_ID)' '$(GAMELIB_ID_COMPAT)' \
+	    '$(TRANSLATOR_ID)' '$(SPIRV_ID)' > "$(DIST)/build-ids.txt"
+	cd "$(DIST)" && find . -type f ! -name files.txt | sed 's|^\./||' | LC_ALL=C sort > files.txt
 	cd build/dist && if command -v zip >/dev/null; then zip -qr "SavageWind-$(VERSION)-windows.zip" "Savage Wind"; \
 	    else /c/Windows/System32/tar.exe -a -cf "SavageWind-$(VERSION)-windows.zip" "Savage Wind"; fi
 	@echo "build/dist/SavageWind-$(VERSION)-windows.zip"
