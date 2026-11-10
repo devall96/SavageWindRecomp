@@ -97,10 +97,11 @@ Coming from Alpha 4 (0.4.x): extract Alpha 5 over your Alpha 4 folder (Windows) 
 game files, saves and settings stay; the start screen asks you to build the game code again (Set up game files) once.
 What's new is in [CHANGELOG.md](CHANGELOG.md).
 
-On Windows, Savage Wind updates itself. When a new release is out, the title menu offers it (**Update now**, **Later**
-or **Skip this version**); Update now closes the game and Savage Wind Configuration takes over: it downloads the new
-zip, checks its SHA-256 against the one GitHub publishes, puts the new files in place, starts again, builds the game
-code again from your game files and starts the game. Game files, saves and settings are kept. The same is in
+On Windows and from the Linux AppImage, Savage Wind updates itself. When a new release is out, the title menu offers it
+(**Update now**, **Later** or **Skip this version**); Update now closes the game and Savage Wind Configuration takes
+over: it downloads the new zip (Windows) or AppImage (Linux, in place of the one you started, under the same name),
+checks its SHA-256 against the one GitHub publishes, puts it in place, starts again, builds the game code again from
+your game files and starts the game. Game files, saves and settings are kept. The same is in
 **Settings > Prelaunch > Updates**. It only contacts GitHub, for the list of releases and the download; turn off
 *Check for updates automatically* there to stop the automatic checks. Installed with Quiver Launcher, GitHub Launcher
 or RecompLauncher, Savage Wind leaves updating to the launcher; after the launcher updates it, the next start builds

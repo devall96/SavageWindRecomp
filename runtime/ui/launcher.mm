@@ -1522,7 +1522,7 @@ static void prelaunch_tab(float sc) {
         ImGui::Spacing();
         ImGui::TextDisabled("%s", tr("Game code: compatible mode (this CPU has no AVX2 / FMA), slower"));
     }
-    if (updater_available()) {  // (a Windows release folder)
+    if (updater_available()) {  // (a Windows release folder, a Linux release AppImage)
         ImGui::Spacing();
         ImGui::Spacing();
         heading("Updates");

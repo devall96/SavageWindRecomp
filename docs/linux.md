@@ -23,6 +23,15 @@ saves, settings (`savagewind.ini`), shader caches, imported fonts. Started witho
 another folder. See [Moving the data folder](data-folder.md) for copying existing data and setting up a launch
 wrapper, including on Steam Deck.
 
+The AppImage updates itself, as the Windows release does: the title menu offers a new release, and Savage Wind
+Configuration downloads it next to the AppImage, checks its SHA-256 against the one GitHub publishes, and puts it in
+place of the one you started, under the same name and path (Steam shortcuts and menu entries keep working). It then
+starts again and builds the game code again from your game files. **Settings > Prelaunch > Updates** does the same by
+hand. It needs the system's libcurl (installed on nearly every distribution; `libcurl4` on Debian / Ubuntu) and a folder
+you can write to: an AppImage in a read-only place, or installed by Quiver Launcher or RecompLauncher (which update it
+themselves), doesn't update itself. While an update is under way, hidden `.savagewind-*` files sit next to the AppImage;
+the next start removes them.
+
 Controllers work as on the other systems (SDL3's gamepad support, bundled): Xbox, PlayStation (DualShock 4,
 DualSense), Switch Pro / Joy-Con, 8BitDo and other pads through the kernel's drivers, plugged in or paired while the
 game runs. For SDL's own drivers (rumble, LEDs and gyro on PlayStation /
