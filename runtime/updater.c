@@ -75,7 +75,6 @@ bool updater_apply(bool then_play, char *why, size_t why_size) {
 }
 bool updater_start_update(void) { return false; }
 bool updater_wait_pid(unsigned long pid, int timeout_ms) { (void)pid, (void)timeout_ms; return true; }
-const char *updater_just_updated(void) { return ""; }
 void updater_cleanup(void) {}
 int updater_test(const char *steps) { (void)steps; fprintf(stderr, "[update] not available here\n"); return 1; }
 #else
@@ -841,7 +840,14 @@ bool updater_apply(bool then_play, char *why, size_t why_size) {
     upd_path(old, sizeof old, "old");
     snprintf(m_old, sizeof m_old, "%s\\files.txt", exe_dir);
     snprintf(m_new, sizeof m_new, "%s\\files.txt", fresh);
-    plat_remove_tree(old);
+    // (an earlier update's old/ still there - its files were in use at that start - would mix into a rollback, and its
+    // applied.txt would stop updater_cleanup from undoing a cut-short install: both have to go first)
+    char applied[1300];
+    upd_path(applied, sizeof applied, "applied.txt");
+    if ((file_exists(old) && !plat_remove_tree(old)) || (file_exists(applied) && remove(applied))) {
+        snprintf(why, why_size, "the previous update's files are still in use: start Savage Wind again, then install");
+        return false;
+    }
     CreateDirectoryA(old, NULL);
     List add = {0}, prev = {0}, next = {0};
     walk(fresh, "", &add);
@@ -950,8 +956,6 @@ bool updater_apply(bool then_play, char *why, size_t why_size) {
     return true;
 }
 
-static char g_just[160];
-const char *updater_just_updated(void) { return g_just; }
 
 // The configuration screen on its update, once this game has ended (its own process: nothing of the game's inherited)
 bool updater_start_update(void) {
@@ -1032,7 +1036,6 @@ void updater_cleanup(void) {
     FILE *f = fopen(mark, "r");
     if (f) { if (!fgets(line, sizeof line, f)) line[0] = 0; fclose(f); }
     line[strcspn(line, "\r\n")] = 0;
-    snprintf(g_just, sizeof g_just, "%s", line);
     // (the previous program may take a moment to end: what is still in use goes at the next start)
     if (!file_exists(old) || plat_remove_tree(old)) {
         plat_remove_tree(dir);

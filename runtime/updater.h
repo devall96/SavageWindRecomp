@@ -60,9 +60,8 @@ bool updater_apply(bool then_play, char *why, size_t why_size);
 // after this process has ended: --wait-pid), for the caller to quit. false: it didn't start.
 bool updater_start_update(void);
 bool updater_wait_pid(unsigned long pid, int timeout_ms);  // true: that process has ended (or never was)
-void updater_cleanup(void);    // at start: what an applied update left in update/
-// The update this start follows ("0.5.0-alpha.5 -> 0.6.0", from the update's own note, read by updater_cleanup): "" when none
-const char *updater_just_updated(void);
+// at start: what an applied update left in update/, and the previous version put back after an install cut short
+void updater_cleanup(void);
 // (test) SAVAGEWIND_UPDATE_TEST=check | download | apply: those steps one after another, logged, then the exit status
 int updater_test(const char *steps);
 

@@ -1133,8 +1133,8 @@ static void updates_section(float sc) {
     case UPD_READY:
         ImGui::TextColored(green, tr("Version %s is downloaded and checked."), u.latest);
         ImGui::TextUnformatted(tr(u.gamecode == UPD_KEPT ? "The game code stays as it is."
-                                  : u.gamecode == UPD_REDONE ? "Afterwards the game code is built again: Game Files > Set up game files (a few minutes)."
-                                  : "Afterwards the game code may have to be built again: Game Files > Set up game files."));
+                                  : u.gamecode == UPD_REDONE ? "Afterwards the game code is built again by itself (a few minutes)."
+                                  : "Afterwards the game code is built again by itself if it has to be."));
         if (u.shaders != UPD_UNKNOWN)
             ImGui::TextUnformatted(tr(u.shaders == UPD_KEPT ? "Shaders are kept."
                                       : "Shaders are made again as they are first drawn, or all at once with Precompile shaders."));
