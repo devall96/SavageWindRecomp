@@ -1334,9 +1334,10 @@ static void update_page(float sc, ImVec2 ds, bool busy, std::string &status, int
     char line[400];
     bool back = !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
                 (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false));
+    auto leave = [&](int to) { g_uflow = 0, stage = U_INIT, shown = -1, asked_check = false, page_out = to; };
     auto close = [&] {  // (started as the game: nothing else to show, so closing the card closes it, as the setup page)
         if (g_setup_only) settings_save(), exit(0);
-        g_uflow = 0, stage = U_INIT, shown = -1, asked_check = false, page_out = MAIN;
+        leave(MAIN);
     };
     switch (stage) {
     case U_WAIT_GAME:
@@ -1427,7 +1428,7 @@ static void update_page(float sc, ImVec2 ds, bool busy, std::string &status, int
         ImGui::TextUnformatted(line);
         static const char *const b[] = {"Set up game files", "Close"};
         int p = update_buttons(sc, b, 2, appearing);
-        if (p == 0) close(), page_out = SETUP;
+        if (p == 0) leave(SETUP);  // (to the game files page, in either mode: not close(), which ends a setup-only start)
         else if (p == 1 || back) close();
         break;
     }
@@ -1451,7 +1452,7 @@ static void update_page(float sc, ImVec2 ds, bool busy, std::string &status, int
         }
         static const char *const b1[] = {"Try again", "Close"}, *const b2[] = {"Open Game Files", "Close"};
         int p = update_buttons(sc, rebuild ? b2 : b1, 2, appearing);
-        if (p == 0 && rebuild) close(), page_out = SETUP;
+        if (p == 0 && rebuild) leave(SETUP);
         else if (p == 0) asked_check = false, stage = U_CHECK;
         else if (p == 1 || back) close();
         break;

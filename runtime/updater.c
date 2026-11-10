@@ -474,9 +474,11 @@ static void *check_thread(void *arg) {
         pthread_mutex_unlock(&g_mu);
         const J *best = NULL, *best_zip = NULL;
         const char *best_ver = NULL;
+        bool cur_pre = strchr(cur, '-') != NULL;  // (a test version - alpha, beta, rc - takes the test releases too)
         for (J *r = list->kid; r; r = r->next) {
-            const char *tag = jstr(r, "tag_name"), *draft = jstr(r, "draft");
+            const char *tag = jstr(r, "tag_name"), *draft = jstr(r, "draft"), *pre = jstr(r, "prerelease");
             if (!tag || (draft && !strcmp(draft, "true"))) continue;
+            if (!cur_pre && pre && !strcmp(pre, "true")) continue;  // (a full release isn't offered a test one)
             const char *ver = tag[0] == 'v' ? tag + 1 : tag;
             if (!isdigit((unsigned char)ver[0]) || strlen(ver) >= sizeof g_st.latest) continue;
             if (updater_version_cmp(ver, cur) <= 0 || (best_ver && updater_version_cmp(ver, best_ver) <= 0)) continue;
@@ -565,12 +567,20 @@ static bool dl_sink(const void *p, size_t n, void *user) {
 static uint32_t rd16(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8; }
 static uint32_t rd32(const uint8_t *p) { return rd16(p) | rd16(p + 2) << 16; }
 
-// A path inside the release folder: relative, '/'-separated, no "." / ".." / empty parts, no drive or stream names
+// A path inside the release folder: relative, '/'-separated, no "." / ".." / empty parts, no drive or stream names,
+// no part Windows would read as another (a device - CON, NUL, COM1, "aux.txt" - or one ending in a dot or a space,
+// which Windows drops)
 static bool safe_rel(const char *rel) {
     if (!*rel || *rel == '/' || strlen(rel) > 400 || strpbrk(rel, "\\:*?\"<>|")) return false;
+    static const char *const dev[] = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"};
     for (const char *p = rel; *p;) {
         size_t n = strcspn(p, "/");
         if (!n || (n == 1 && p[0] == '.') || (n == 2 && p[0] == '.' && p[1] == '.')) return false;
+        if (p[n - 1] == '.' || p[n - 1] == ' ') return false;
+        size_t base = strcspn(p, "./");  // (a device name counts with any extension: "nul.txt" is NUL)
+        for (size_t i = 0; i < sizeof dev / sizeof *dev; i++)
+            if (base == strlen(dev[i]) && !_strnicmp(p, dev[i], base)) return false;
+        if (base == 4 && (!_strnicmp(p, "COM", 3) || !_strnicmp(p, "LPT", 3)) && p[3] >= '0' && p[3] <= '9') return false;
         p += n;
         if (*p == '/') p++;
     }
